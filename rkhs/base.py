@@ -54,7 +54,7 @@ class ExpandableFunction:
 def make_kme_dot_product(kernel: Kernel) -> ExpandableFunction:
     def dot_product(xs_1: jnp.ndarray, xs_2: jnp.ndarray) -> jnp.ndarray:
         kernel_matrix = kernel.many_many(xs_1, xs_2)
-        return kernel_matrix.sum() / (xs_1.shape[0] * xs_2.shape[0])
+        return kernel_matrix.mean()
 
     return ExpandableFunction(dot_product, input_dim=kernel.input_dim + 1)
 
@@ -63,10 +63,7 @@ def make_squared_mmd(kernel: Kernel) -> ExpandableFunction:
     dot_product = make_kme_dot_product(kernel)
 
     def squared_mmd(xs_1: jnp.ndarray, xs_2: jnp.ndarray) -> jnp.ndarray:
-        dot_product_11 = dot_product(xs_1, xs_1)
-        dot_product_22 = dot_product(xs_2, xs_2)
-        dot_product_12 = dot_product(xs_1, xs_2)
-        return dot_product_11 + dot_product_22 - 2 * dot_product_12
+        return dot_product(xs_1, xs_1) - 2 * dot_product(xs_1, xs_2) + dot_product(xs_2, xs_2)
 
     return ExpandableFunction(squared_mmd, input_dim=kernel.input_dim + 1)
 
@@ -93,7 +90,7 @@ class Kernel(ExpandableFunction):
         self.squared_mmd = make_squared_mmd(self)
         self.mmd = make_mmd(self)
 
-    def __matmul__(self, other: Kernel) -> Kernel:
+    def __mul__(self, other: Kernel) -> Kernel:
         assert isinstance(other, Kernel)
         assert self.input_dim == other.input_dim
 
