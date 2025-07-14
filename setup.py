@@ -11,8 +11,8 @@ setup(
     url="https://github.com/lukashaverbeck/rkhs",
     author="Lukas Haverbeck",
     license="MIT",
-    python_requires=">=3.11",
+    python_requires=">=3.12",
     install_requires=["jax"],
     packages=find_packages(),
-    include_package_data=True,
+    include_package_data=False
 )
