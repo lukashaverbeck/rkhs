@@ -1,18 +1,19 @@
-from typing import Final, Literal
+import math
+from typing import Sequence, Final
 
 import jax.numpy as jnp
 from jax import Array
 from jax.typing import ArrayLike
 
-from rkhs.base import Kernel
+from rkhs._base import Kernel
 
 
 class LinearKernel(Kernel):
-    def __init__(self, ndim: int = 1):
-        if ndim not in {0, 1}:
-            raise ValueError(f"Linear kernel only supports scalar or 1D inputs. Got {ndim}.")
+    def __init__(self, data_shape: Sequence[int]):
+        if len(data_shape) > 1:
+            raise ValueError(f"Linear kernel only supports scalar or 1D inputs. Got shape {data_shape}.")
 
-        super().__init__(ndim=ndim)
+        super().__init__(data_shape=data_shape, rkhs_dim=math.prod(data_shape))
 
     def _dot(self, x_1: Array, x_2: Array) -> Array:
         return jnp.dot(x_1, x_2)
@@ -21,11 +22,11 @@ class LinearKernel(Kernel):
 class PolynomialKernel(Kernel):
     degree: Final[float]
 
-    def __init__(self, degree: int, ndim: int = 1):
-        if ndim not in {0, 1}:
-            raise ValueError(f"Polynomial kernel only supports scalar or 1D inputs. Got {ndim}.")
+    def __init__(self, degree: int, data_shape: Sequence[int]):
+        if len(data_shape) > 1:
+            raise ValueError(f"Polynomial kernel only supports scalar or 1D inputs. Got shape {data_shape}.")
 
-        super().__init__(ndim=ndim)
+        super().__init__(data_shape=data_shape, rkhs_dim=math.comb(math.prod(data_shape) + degree, degree))
         self.degree = degree
 
     def _dot(self, x_1: Array, x_2: Array) -> Array:
@@ -35,11 +36,13 @@ class PolynomialKernel(Kernel):
 class GaussianKernel(Kernel):
     bandwidth: Final[Array]
 
-    def __init__(self, bandwidth: ArrayLike, ndim: Literal[0, 1] = 1):
-        if ndim not in {0, 1}:
-            raise ValueError(f"Gaussian kernel only supports scalar or 1D inputs. Got {ndim}.")
+    def __init__(self, bandwidth: ArrayLike, data_shape: Sequence[int]):
+        if len(data_shape) > 1:
+            raise ValueError(f"Gaussian kernel only supports scalar or 1D inputs. Got shape {data_shape}.")
 
-        bandwidth = jnp.broadcast_to(bandwidth, ndim)
+        super().__init__(data_shape=data_shape, rkhs_dim="inf")
+
+        bandwidth = jnp.broadcast_to(bandwidth, self.data_ndim)
 
         if jnp.any(bandwidth <= 0):
             raise ValueError(f"Bandwidth must be positive. Got {bandwidth}.")
@@ -47,8 +50,6 @@ class GaussianKernel(Kernel):
             raise ValueError(f"Bandwidth must be a scalar or a vector. Got {bandwidth.ndim}.")
 
         self.bandwidth = bandwidth
-
-        super().__init__(ndim=ndim)
 
     def _dot(self, x_1: Array, x_2: Array) -> Array:
         difference = (x_1 - x_2) / self.bandwidth
@@ -62,11 +63,11 @@ class MaternKernel(Kernel):
 
     SUPPORTED_NU = {1 / 2, 3 / 2, 5 / 2}
 
-    def __init__(self, bandwidth: float, length_scale: float, nu: float, ndim: Literal[0, 1] = 1):
-        super().__init__(ndim)
+    def __init__(self, bandwidth: float, length_scale: float, nu: float, data_shape: Sequence[int]):
+        super().__init__(data_shape=data_shape, rkhs_dim="inf")
 
-        if ndim not in {0, 1}:
-            raise ValueError(f"Matérn kernel only supports scalar or 1D inputs. Got {ndim}.")
+        if len(data_shape) > 1:
+            raise ValueError(f"Matérn kernel only supports scalar or 1D inputs. Got shape {data_shape}.")
 
         if bandwidth <= 0:
             raise ValueError(f"Bandwidth must be positive. Got {bandwidth}.")
@@ -98,9 +99,9 @@ class MaternKernel(Kernel):
 class LaplacianKernel(Kernel):
     length_scale: Final[float]
 
-    def __init__(self, length_scale: float, ndim: Literal[0, 1] = 1):
-        if ndim not in {0, 1}:
-            raise ValueError(f"Gaussian kernel only supports scalar or 1D inputs. Got {ndim}.")
+    def __init__(self, length_scale: float, data_shape: Sequence[int]):
+        if len(data_shape) > 1:
+            raise ValueError(f"Gaussian kernel only supports scalar or 1D inputs. Got shape {data_shape}.")
 
         if jnp.any(length_scale <= 0):
             raise ValueError(f"Length scale must be positive. Got {length_scale}.")
@@ -109,7 +110,7 @@ class LaplacianKernel(Kernel):
 
         self.length_scale = length_scale
 
-        super().__init__(ndim=ndim)
+        super().__init__(data_shape=data_shape, rkhs_dim="inf")
 
     def _dot(self, x_1: Array, x_2: Array) -> Array:
         return jnp.exp(-jnp.linalg.norm(x_1 - x_2, ord=1) / self.length_scale)

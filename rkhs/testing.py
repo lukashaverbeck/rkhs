@@ -1,443 +1,405 @@
 from __future__ import annotations
 
-import math
 from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
 from functools import partial
-from typing import Final, Self, NamedTuple, Optional, Any
+from typing import Self, ClassVar, Optional, Literal, Sequence, NamedTuple
 
 import jax
 import jax.numpy as jnp
 from jax import Array
 from jax.typing import ArrayLike
 
-import rkhs.base as rkhs
-from rkhs._util import _make_arg_signature
-from rkhs.base import VectorKernel, Kernel, KME, Fn, CMO
-from rkhs.sampling import bootstrap_distance, _bootstrap_masked_indices, _resample_cme, _extract_submatrix
+import rkhs
+from rkhs import Fn, CME, Kernel, VectorKernel
+from rkhs._util import is_broadcastable, expand_shape
 
 
-@partial(jax.jit)
-def _posterior_std(cme: CMO, x: Array, influence_vector: Optional[Array] = None) -> Array:
-    if influence_vector is None:
-        influence_vector = cme.influence(x)
+def _resample_masked_population(population: Array, mask: Array, shape: Sequence[int], key: Array) -> Array:
+    if population.ndim != 1:
+        raise TypeError(f"Only supports 1D arrays. Got shape {population.shape}.")
 
-    arg_signature_x = _make_arg_signature(cme.kernel.x.ndim, 'x')
+    if mask.shape[-1] != population.shape[0]:
+        raise TypeError(f"Mask shape {mask.shape} does not match population shape in last axis. "
+                        f"Got mask of shape {mask.shape} for population shape {population.shape}.")
 
-    @partial(jnp.vectorize, signature=f"(n,{arg_signature_x}),({arg_signature_x}),(n)->()")
-    def vectorized(xs_: Array, x_: Array, influence_vector_: Array) -> Array:
-        kernel_vector = cme.kernel.x(xs_, x_)
-        return jnp.sqrt(cme.kernel.x(x_, x_) - jnp.dot(kernel_vector, influence_vector_))
+    if len(shape) == 0:
+        raise ValueError("Mask shape must not be empty.")
 
-    return vectorized(cme.xs, x, influence_vector)
+    population_size = population.shape[0]
+    batch_shape = shape[:-1]
+    sample_size = shape[-1]
+
+    def sample(key_: Array, mask_: Array) -> Array:
+        mask_degenerate = jnp.all(mask_)
+        return jax.random.choice(key_, population, shape=(sample_size,), replace=True, p=1 - mask_ + mask_degenerate)
+
+    mask = jnp.broadcast_to(mask, shape=(*batch_shape, population_size)).reshape(-1, population_size)
+    keys = jax.random.split(key, num=len(mask))
+    sample_batch = jax.vmap(sample)(keys, mask)
+
+    return sample_batch.reshape(shape)
 
 
-class TestEmbedding[T: Fn](ABC):
-    kme: Final[T]
+def _extract_submatrix(matrix: Array, indices_1: Array, indices_2: Array) -> Array:
+    return jnp.take_along_axis(
+        jnp.take_along_axis(matrix, indices_1[..., :, None], axis=-2),
+        indices_2[..., None, :],
+        axis=-1,
+    )
 
-    def __init__(self, kme: Fn):
-        self.kme = kme
 
-    @classmethod
+@partial(jax.tree_util.register_dataclass)
+@dataclass(frozen=True)
+class MarginalTestEmbedding(ABC):
+    analytical: ClassVar[type[AnalyticalMarginalTestEmbedding]]
+    bootstrap: ClassVar[type[BootstrapMarginalTestEmbedding]]
+
+    kme: Fn
+
     @abstractmethod
-    def tree_unflatten(cls, aux_data: Any, children: Any) -> Self:
+    def __call__(self, level: ArrayLike) -> Array:
         raise NotImplementedError
 
-    @abstractmethod
-    def tree_flatten(self) -> tuple[Any, Any]:
-        raise NotImplementedError
 
-    @abstractmethod
-    def _threshold(self, level: Array) -> Array:
-        raise NotImplementedError
-
-    def threshold(self, level: ArrayLike) -> Array:
-        original_shape = jnp.shape(level)
-        level = jnp.asarray(level).reshape(-1)
-
-        threshold_batch = jax.lax.map(self._threshold, level)
-
-        target_batch_shape = (math.prod(original_shape), *self.kme.shape)
-        if threshold_batch.shape != target_batch_shape:
-            raise TypeError(f"Threshold batch should have shape {target_batch_shape}. Got {threshold_batch.shape}.")
-
-        return threshold_batch.reshape(*original_shape, *self.kme.shape)
-
-
-class MarginalTest(TestEmbedding[KME], ABC):
-    @classmethod
-    def analytical(cls, kme: KME, kernel_bound: float) -> AnalyticalMarginalTest:
-        return AnalyticalMarginalTest.from_kme(kme, kernel_bound)
+@partial(jax.tree_util.register_dataclass)
+@dataclass(frozen=True)
+class AnalyticalMarginalTestEmbedding(MarginalTestEmbedding):
+    kernel_bound: float = field(metadata=dict(static=True))
 
     @classmethod
-    def bootstrap(cls, kme: KME, n_bootstrap: int, key: Array) -> BootstrapMarginalTest:
-        return BootstrapMarginalTest.from_kme(kme, key, n_bootstrap)
-
-
-@partial(jax.tree_util.register_pytree_node_class)
-class AnalyticalMarginalTest(MarginalTest):
-    kernel_bound: Final[float]
-    dataset_size: Final[int]
-
-    @classmethod
-    def from_data(cls, kernel: Kernel, kernel_bound: float, xs: Array, mask: Optional[Array] = None) -> Self:
+    def from_data(cls, kernel: Kernel, xs: Array, kernel_bound: float, mask: Optional[Array] = None) -> Self:
         kme = kernel.kme(xs, mask=mask)
-        return AnalyticalMarginalTest.from_kme(kme, kernel_bound)
+        return cls.from_kme(kme, kernel_bound)
 
     @classmethod
-    def from_kme(cls, kme: KME, kernel_bound: float) -> Self:
-        return AnalyticalMarginalTest(kme=kme, kernel_bound=kernel_bound, dataset_size=kme.n_points)
+    def from_kme(cls, kme: Fn, kernel_bound: float) -> Self:
+        return cls(kme, kernel_bound)
 
-    def __init__(self, kme: KME, kernel_bound: float, dataset_size: int):
-        super().__init__(kme)
-        self.kernel_bound = kernel_bound
-        self.dataset_size = dataset_size
-
-    @classmethod
-    def tree_unflatten(cls, aux_data: Any, children: Any) -> Self:
-        kernel_bound, dataset_size = children
-        kme, = children
-        return AnalyticalMarginalTest(kme=kme, kernel_bound=kernel_bound, dataset_size=dataset_size)
-
-    def tree_flatten(self) -> tuple[Any, Any]:
-        return (self.kme,), (self.kernel_bound, self.dataset_size),
-
-    def _threshold(self, level: Array) -> Array:
-        kernel_bound = jnp.broadcast_to(self.kernel_bound, self.kme.shape)
-        dataset_size = jnp.broadcast_to(self.dataset_size, self.kme.shape)
-        return jnp.sqrt(kernel_bound / dataset_size) + jnp.sqrt(-2 * kernel_bound * jnp.log(level) / dataset_size)
+    def __call__(self, level: ArrayLike) -> Array:
+        dataset_size = self.kme.dataset_size()
+        return jnp.sqrt(8 * self.kernel_bound * jnp.log(2 / level) / dataset_size)
 
 
-@partial(jax.tree_util.register_pytree_node_class)
-class BootstrapMarginalTest(MarginalTest):
-    threshold_null: Final[Array]
+@partial(jax.tree_util.register_dataclass)
+@dataclass(frozen=True)
+class BootstrapMarginalTestEmbedding(MarginalTestEmbedding):
+    threshold_null: Array
 
     @classmethod
-    def from_data(cls, kernel: Kernel, xs: Array, key: Array, n_bootstrap: int, mask: Optional[Array] = None) -> Self:
+    def from_data(
+            cls, kernel: Kernel, xs: Array, key: Array, n_bootstrap: int,
+            mask: Optional[Array] = None
+    ) -> Self:
         kme = kernel.kme(xs, mask=mask)
-        return BootstrapMarginalTest.from_kme(kme, key, n_bootstrap)
+        return cls.from_kme(kme, key, n_bootstrap)
 
     @classmethod
-    def from_kme(cls, kme: KME, key: Array, n_bootstrap: int) -> Self:
-        threshold_null = bootstrap_distance(kme, kme, key, n_bootstrap)
-        return BootstrapMarginalTest(kme=kme, threshold_null=threshold_null)
+    @partial(jax.jit, static_argnums={0, 3})
+    def from_kme(cls, kme: Fn, key: Array, n_bootstrap: int) -> Self:
+        dataset_size = kme.dataset_size()
 
-    def __init__(self, kme: KME, threshold_null: Array):
-        if threshold_null.shape[1:] != kme.shape:
-            raise TypeError(f"Expected threshold null distribution to hold one array for every mean embedding. "
-                            f"Got shapes {kme.shape} and {threshold_null.shape}.")
+        bootstrap_multiplicities = jax.random.multinomial(
+            key, kme.dataset_shape_size,
+            p=(1 - kme.mask) / dataset_size,
+            shape=(n_bootstrap, *kme.shape, kme.dataset_shape_size),
+        )
 
-        super().__init__(kme)
-        self.threshold_null = threshold_null
+        bootstrap_kmes = kme.kernel.fn(
+            points=kme.points, coefficients=bootstrap_multiplicities / dataset_size, mask=kme.mask
+        )
 
-    @classmethod
-    def tree_unflatten(cls, aux_data: Any, children: Any) -> Self:
-        kme, threshold_null = children
-        return BootstrapMarginalTest(kme=kme, threshold_null=threshold_null)
+        bootstrap_mmd = rkhs.distance(bootstrap_kmes, kme)
+        bootstrap_mmd = bootstrap_mmd.transpose(*range(1, bootstrap_mmd.ndim), 0)
 
-    def tree_flatten(self) -> tuple[Any, Any]:
-        return (self.kme, self.threshold_null), None
+        return BootstrapMarginalTestEmbedding(kme, bootstrap_mmd)
 
-    def _threshold(self, level: Array) -> Array:
-        return jnp.quantile(self.threshold_null, 1 - level, axis=0)
+    def __post_init__(self):
+        if self.threshold_null.shape[:-1] != self.kme.shape:
+            raise TypeError(f"Inconsistent shapes for threshold null distribution and KME. "
+                            f"Got {self.threshold_null.shape} and {self.kme.shape}.")
+
+    def __call__(self, level: ArrayLike) -> Array:
+        return jnp.quantile(self.threshold_null, q=1 - level, axis=-1)
 
 
-class ConditionedTest(TestEmbedding[Fn], ABC):
-    std: Final[Array]
+MarginalTestEmbedding.analytical = AnalyticalMarginalTestEmbedding
+MarginalTestEmbedding.bootstrap = BootstrapMarginalTestEmbedding
 
-    def __init__(self, kme: Fn, std: Array):
-        if kme.shape != std.shape:
-            raise TypeError(f"Expect standard deviation to match mean embedding. "
-                            f"Got shapes {std.shape} and {kme.shape}.")
 
-        super().__init__(kme)
-        self.std = std
+@partial(jax.tree_util.register_dataclass)
+@dataclass(frozen=True)
+class ConditionedTestEmbedding(MarginalTestEmbedding, ABC):
+    std: Array
 
     @abstractmethod
-    def beta(self, level: Array) -> Array:
+    def beta(self, level: ArrayLike) -> Array:
         raise NotImplementedError
 
-    def _threshold(self, level: Array) -> Array:
-        beta = self.beta(level)
-        beta, level = jnp.broadcast_arrays(beta, level)
+    def __batch_beta(self, level: Array) -> Array:
+        @partial(jax.vmap)
+        def batch(level_: Array) -> Array:
+            return self.beta(level_)
+
+        return batch(level)
+
+    def __call__(self, level: ArrayLike) -> ArrayLike:
+        level = jnp.asarray(level)
+        beta = self.__batch_beta(level.reshape(-1))
+        beta = beta.reshape(*level.shape, *beta.shape[1:])
+
         return beta * self.std
 
 
-@partial(jax.tree_util.register_pytree_node_class)
-class AnalyticalConditionedTest(ConditionedTest):
-    log_determinant: Final[Array]
-    rkhs_norm: Final[Array]
-    sub_gaussian_std: Final[Array]
-    regularization: Final[float]
+@partial(jax.tree_util.register_dataclass)
+@dataclass(frozen=True)
+class AnalyticalConditionedTestEmbedding(ConditionedTestEmbedding):
+    log_determinant: Array
+    rkhs_norm_bound: float = field(metadata=dict(static=True))
+    sub_gaussian_std: float = field(metadata=dict(static=True))
+    regularization: float = field(metadata=dict(static=True))
 
-    def __init__(
-            self,
-            kme: Fn,
-            std: Array,
-            log_determinant: Array, rkhs_norm: ArrayLike, sub_gaussian_std: ArrayLike, regularization: float
-    ):
-        super().__init__(kme, std)
-
-        if log_determinant.shape != kme.shape:
-            raise TypeError(f"Expect log-determinant to match mean embedding. "
-                            f"Got shapes {log_determinant.shape} and {kme.shape}.")
-
-        rkhs_norm = jnp.broadcast_to(rkhs_norm, self.kme.shape)
-        sub_gaussian_std = jnp.broadcast_to(sub_gaussian_std, self.kme.shape)
-
-        self.log_determinant = log_determinant
-        self.rkhs_norm = rkhs_norm
-        self.sub_gaussian_std = sub_gaussian_std
-        self.regularization = regularization
-
-    @classmethod
-    def tree_unflatten(cls, aux_data: Any, children: Any) -> Self:
-        regularization = aux_data
-        kme, std, log_determinant, rkhs_norm, sub_gaussian_std = children
-        return AnalyticalConditionedTest(
-            kme=kme,
-            std=std,
-            log_determinant=log_determinant,
-            rkhs_norm=rkhs_norm,
-            sub_gaussian_std=sub_gaussian_std,
-            regularization=regularization
-        )
-
-    def tree_flatten(self) -> tuple[Any, Any]:
-        return (
-            self.kme,
-            self.std,
-            self.log_determinant, self.rkhs_norm, self.sub_gaussian_std
-        ), self.regularization
-
-    def beta(self, level: Array) -> Array:
-        return self.rkhs_norm + self.sub_gaussian_std * jnp.sqrt(
+    def beta(self, level: ArrayLike) -> Array:
+        return self.rkhs_norm_bound + self.sub_gaussian_std * jnp.sqrt(
             (self.log_determinant - 2 * jnp.log(level)) / self.regularization
         )
 
 
-@partial(jax.tree_util.register_pytree_node_class)
-class BootstrapConditionedTest(ConditionedTest):
-    beta_null: Final[Array]
+@partial(jax.tree_util.register_dataclass)
+@dataclass(frozen=True)
+class BootstrapConditionedTestEmbedding(ConditionedTestEmbedding):
+    beta_null: Array
 
-    def __init__(self, kme: Fn, std: Array, beta_null: Array):
-        super().__init__(kme, std)
-        beta_null = beta_null.reshape(-1, *(1,) * len(kme.shape))
-        self.beta_null = jnp.broadcast_to(beta_null, (beta_null.shape[0], *kme.shape))
-
-    @classmethod
-    def tree_unflatten(cls, aux_data: Any, children: Any) -> Self:
-        kme, std, beta_null = children
-        return BootstrapConditionedTest(kme=kme, std=std, beta_null=beta_null)
-
-    def tree_flatten(self) -> tuple[Any, Any]:
-        return (self.kme, self.std, self.beta_null), None
-
-    def beta(self, level: Array) -> Array:
-        return jnp.quantile(self.beta_null, 1 - level, axis=0)
+    def beta(self, level: ArrayLike) -> Array:
+        return jnp.quantile(self.beta_null, q=1 - level, axis=-1)
 
 
-class ConditionalTest(ABC):
-    cme: Final[CMO]
+@partial(jax.tree_util.register_dataclass)
+@dataclass(frozen=True)
+class ConditionalTestEmbedding(ABC):
+    analytical: ClassVar[type[AnalyticalConditionalTestEmbedding]]
+    bootstrap: ClassVar[type[BootstrapConditionalTestEmbedding]]
 
-    def __init__(self, cme: CMO):
-        self.cme = cme
+    cme: CME
 
     @classmethod
-    @abstractmethod
-    def tree_unflatten(cls, aux_data: Any, children: Any) -> Self:
-        raise NotImplementedError
+    def _std(cls, cme: CME, x: Array, influence: Optional[Array] = None) -> Array:
+        if influence is None:
+            influence = cme.influence(x)
+
+        k_x = cme.kernel.x.vector(cme.xs, x)
+        return jnp.sqrt(cme.kernel.x(x, x) - (k_x * influence).sum(axis=-1))
+
+    def std(self, x: Array, influence: Optional[Array] = None) -> Array:
+        return self._std(self.cme, x, influence)
 
     @abstractmethod
-    def tree_flatten(self) -> tuple[Any, Any]:
-        raise NotImplementedError
-
-    def std(self, x: Array) -> Array:
-        return _posterior_std(self.cme, x)
-
-    @abstractmethod
-    def __call__(self, x: Array) -> TestEmbedding:
+    def __call__(self, x: Array) -> MarginalTestEmbedding:
         raise NotImplementedError
 
 
-@partial(jax.tree_util.register_pytree_node_class)
-class AnalyticalConditionalTest(ConditionalTest):
+@partial(jax.tree_util.register_dataclass)
+@dataclass(frozen=True)
+class AnalyticalConditionalTestEmbedding(ConditionalTestEmbedding):
     log_determinant: Array
-    rkhs_norm: Array
-    sub_gaussian_std: Array
+    rkhs_norm_bound: float = field(metadata=dict(static=True))
+    sub_gaussian_std: float = field(metadata=dict(static=True))
 
     @classmethod
     def from_data(
-            cls, kernel: VectorKernel, xs: Array, ys: Array, rkhs_norm: ArrayLike, sub_gaussian_std: ArrayLike
+            cls, kernel: VectorKernel, xs: Array, ys: Array, rkhs_norm_bound: float, sub_gaussian_std: float,
+            mask: Optional[Array] = None
     ) -> Self:
-        cme = kernel.cme(xs, ys)
-        return cls.from_cme(cme, rkhs_norm, sub_gaussian_std)
+        cme = kernel.cme(xs, ys, mask=mask)
+        return cls.from_cme(cme, rkhs_norm_bound, sub_gaussian_std)
 
     @classmethod
-    def from_cme(cls, cme: CMO, rkhs_norm: ArrayLike, sub_gaussian_std: ArrayLike) -> Self:
-        _, log_determinant = jnp.linalg.slogdet(jnp.eye(cme.n_points) + cme.gram / cme.kernel.regularization)
+    def from_cme(cls, cme: CME, rkhs_norm_bound: float, sub_gaussian_std: float) -> Self:
+        gram = cme.kernel.x.gram(cme.xs)
+        _, log_determinant = jnp.linalg.slogdet(jnp.eye(cme.dataset_shape_size) + gram / cme.kernel.regularization)
 
-        rkhs_norm = jnp.broadcast_to(rkhs_norm, log_determinant.shape)
-        sub_gaussian_std = jnp.broadcast_to(sub_gaussian_std, log_determinant.shape)
+        return AnalyticalConditionalTestEmbedding(cme, log_determinant, rkhs_norm_bound, sub_gaussian_std)
 
-        return AnalyticalConditionalTest(
-            cme=cme,
-            log_determinant=log_determinant,
-            rkhs_norm=rkhs_norm,
-            sub_gaussian_std=sub_gaussian_std
-        )
+    def __post_init__(self):
+        if not is_broadcastable(self.cme.shape, self.log_determinant.shape):
+            raise TypeError(f"Inconsistent shape for cme and log determinant. Got shapes {self.cme.shape} and "
+                            f"{self.log_determinant.shape}.")
 
-    def __init__(self, cme: CMO, log_determinant: ArrayLike, rkhs_norm: ArrayLike, sub_gaussian_std: ArrayLike):
-        super().__init__(cme)
+    def __call__(self, x: Array) -> AnalyticalConditionedTestEmbedding:
+        kme = self.cme(x)
 
-        self.log_determinant = jnp.asarray(log_determinant)
-        self.rkhs_norm = jnp.asarray(rkhs_norm)
-        self.sub_gaussian_std = jnp.asarray(sub_gaussian_std)
-
-    @classmethod
-    def tree_unflatten(cls, aux_data: Any, children: Any) -> Self:
-        cme, log_determinant, sub_gaussian_std = children
-        return AnalyticalConditionalTest(
-            cme=cme,
-            log_determinant=log_determinant,
-            sub_gaussian_std=sub_gaussian_std
-        )
-
-    def tree_flatten(self) -> tuple[Any, Any]:
-        return (self.cme, self.log_determinant, self.sub_gaussian_std), None
-
-    def __call__(self, x: Array) -> TestEmbedding:
-        return AnalyticalConditionedTest(
-            kme=self.cme(x),
-            std=self.std(x),
+        return AnalyticalConditionedTestEmbedding(
+            kme=kme,
+            std=self.std(x, kme.coefficients),
             log_determinant=self.log_determinant,
-            rkhs_norm=self.rkhs_norm,
+            rkhs_norm_bound=self.rkhs_norm_bound,
             sub_gaussian_std=self.sub_gaussian_std,
             regularization=self.cme.kernel.regularization
         )
 
 
-@partial(jax.tree_util.register_pytree_node_class)
-class BootstrapConditionalTest(ConditionalTest):
-    beta_null: Final[Array]
+@partial(jax.tree_util.register_dataclass)
+@dataclass(frozen=True)
+class BootstrapConditionalTestEmbedding(ConditionalTestEmbedding):
+    type Mode = Literal["resample", "resample-double", "wild"]
+    DEFAULT_MODE: ClassVar[Mode] = "resample-double"
 
-    @classmethod
-    @partial(jax.jit, static_argnums={0, 3})
-    def __bootstrap_beta(cls, cme: CMO, key: Array, n_bootstrap: int, es: Optional[Array] = None) -> Array:
-        if es is None:
-            es = cme.xs
-
-        if es.shape[-cme.kernel.x.ndim:] != cme.shape_x:
-            raise TypeError(f"Expected shape of es to match shape of cme. Got shape {es.shape} and {cme.shape}.")
-
-        def bootstrap_single_beta(cme_: CMO, kmes: Fn, es_: Array, gram_y: Array, stds: Array, key_: Array) -> Array:
-            resampled_indices = _bootstrap_masked_indices(cme_.mask, key_, shape=(1, cme_.n_points))
-            bootstrap_cme = _resample_cme(cme_, resampled_indices)[0]
-            bootstrap_kmes = bootstrap_cme(es_)
-
-            identity_indices = jnp.arange(cme_.n_points)
-            bootstrap_gram_y_22 = _extract_submatrix(gram_y, resampled_indices, resampled_indices)
-            bootstrap_gram_y_12 = _extract_submatrix(gram_y, identity_indices, resampled_indices)
-
-            bootstrap_cmmds = rkhs.distance(
-                kmes, bootstrap_kmes,
-                kernel_matrix_11=gram_y,
-                kernel_matrix_22=bootstrap_gram_y_22,
-                kernel_matrix_12=bootstrap_gram_y_12,
-            )
-
-            bootstrap_stds = _posterior_std(bootstrap_cme, es_, bootstrap_kmes.coefficients)
-
-            return (bootstrap_cmmds / (stds + bootstrap_stds)).max()
-
-        def bootstrap_beta(cme_: CMO, es_: Array, key_: Array) -> Array:
-            kmes = cme_(es_)
-            stds = _posterior_std(cme_, es_, kmes.coefficients)
-            gram_y = cme.kernel.y.gram(cme_.ys, mask=cme_.mask)
-
-            keys_ = jax.random.split(key_, n_bootstrap)
-
-            return jax.lax.map(
-                f=lambda key__: bootstrap_single_beta(cme_, kmes, es_, gram_y, stds, key__),
-                xs=keys_,
-            )
-
-        batch_shape = cme.shape
-        cme = cme.reshape(-1)
-        es = es.reshape(len(cme), -1, *cme.shape_x)
-        keys = jax.random.split(key, len(cme))
-
-        bootstrap_betas = jax.lax.map(
-            f=lambda inp: bootstrap_beta(*inp),
-            xs=(cme, es, keys)
-        )
-
-        return bootstrap_betas.transpose(1, 0).reshape(n_bootstrap, *batch_shape)
+    beta_null: Array
 
     @classmethod
     def from_data(
-            cls,
-            kernel: VectorKernel,
-            xs: Array, ys: Array,
-            key: Array,
-            n_bootstrap: int,
+            cls, kernel: VectorKernel, xs: Array, ys: Array, grid: Array, key: Array, n_bootstrap: int,
             mask: Optional[Array] = None,
-            es: Optional[Array] = None
+            mode: Mode = DEFAULT_MODE
     ) -> Self:
         cme = kernel.cme(xs, ys, mask=mask)
-        return BootstrapConditionalTest.from_cme(cme, key, n_bootstrap, es=es)
+        return cls.from_cme(cme, grid, key, n_bootstrap, mode=mode)
 
     @classmethod
-    def from_cme(cls, cme: CMO, key: Array, n_bootstrap: int, es: Optional[Array] = None) -> Self:
-        bootstrap_betas = cls.__bootstrap_beta(cme, key, n_bootstrap, es=es)
-        return BootstrapConditionalTest(cme, bootstrap_betas)
-
-    def __init__(self, cme: CMO, beta_null: Array):
-        super().__init__(cme)
-
-        if beta_null.shape[1:] != cme.shape:
-            raise TypeError(f"Expected beta null distribution to hold one array for every mean embedding. "
-                            f"Got shapes {cme.shape} and {beta_null.shape}.")
-
-        self.beta_null = beta_null
+    def from_cme(cls, cme: CME, grid: Array, key: Array, n_bootstrap: int, mode: Mode = DEFAULT_MODE) -> Self:
+        if mode == "resample":
+            return cls.resample(cme, grid, key, n_bootstrap)
+        elif mode == "resample-double":
+            return cls.resample_double(cme, grid, key, n_bootstrap)
+        elif mode == "wild":
+            return cls.wild(cme, grid, key, n_bootstrap)
+        else:
+            raise NotImplementedError(f"Unsupported mode {mode}.")
 
     @classmethod
-    def tree_unflatten(cls, aux_data: Any, children: Any) -> Self:
-        cme, beta_null = children
-        return BootstrapConditionalTest(cme=cme, beta_null=beta_null)
+    def __resample_beta(cls, cme: CME, grid: Array, indices_1: Array, indices_2: Array, gram_y: Array) -> Array:
+        xs_1, ys_1 = cme.take_data(indices_1)
+        xs_2, ys_2 = cme.take_data(indices_2)
 
-    def tree_flatten(self) -> tuple[Any, Any]:
-        return (self.cme, self.beta_null), None
+        cme_1 = cme.kernel.cme(xs_1, ys_1, mask=cme.mask).expand_dims(-1)
+        cme_2 = cme.kernel.cme(xs_2, ys_2, mask=cme.mask).expand_dims(-1)
 
-    def __call__(self, x: Array) -> BootstrapConditionedTest:
-        return BootstrapConditionedTest(
-            kme=self.cme(x),
-            std=self.std(x),
-            beta_null=self.beta_null,
+        kmes_1 = cme_1(grid)
+        kmes_2 = cme_2(grid)
+
+        std_1 = cls._std(cme_1, grid, kmes_1.coefficients)
+        std_2 = cls._std(cme_2, grid, kmes_2.coefficients)
+
+        gram_y_11 = _extract_submatrix(gram_y, indices_1, indices_1)
+        gram_y_22 = _extract_submatrix(gram_y, indices_2, indices_2)
+        gram_y_12 = _extract_submatrix(gram_y, indices_1, indices_2)
+
+        gram_y_11 = jnp.expand_dims(gram_y_11, axis=cme.dataset_axis)
+        gram_y_22 = jnp.expand_dims(gram_y_22, axis=cme.dataset_axis)
+        gram_y_12 = jnp.expand_dims(gram_y_12, axis=cme.dataset_axis)
+
+        cmmd = rkhs.distance(kmes_1, kmes_2, gram_11=gram_y_11, gram_22=gram_y_22, gram_12=gram_y_12)
+
+        return cmmd / (std_1 + std_2)
+
+    @classmethod
+    @partial(jax.jit, static_argnums={0, 4})
+    def resample(cls, cme: CME, grid: Array, key: Array, n_bootstrap: int) -> Self:
+        indices = jnp.arange(cme.dataset_shape_size)
+        gram = cme.kernel.y.gram(cme.ys)
+
+        def resample(bootstrap_indices_: Array) -> Array:
+            identity = expand_shape(indices, dims=cme.ndim + 1)
+            return cls.__resample_beta(cme, grid, bootstrap_indices_, identity, gram).max(axis=-1)
+
+        bootstrap_indices = _resample_masked_population(
+            indices, cme.mask,
+            shape=(n_bootstrap, *cme.shape, cme.dataset_shape_size,),
+            key=key
         )
+
+        bootstrap_beta = jax.lax.map(resample, bootstrap_indices)
+        bootstrap_beta = bootstrap_beta.transpose(*range(1, bootstrap_beta.ndim), 0)
+
+        return BootstrapConditionalTestEmbedding(cme, bootstrap_beta)
+
+    @classmethod
+    @partial(jax.jit, static_argnums={0, 4})
+    def resample_double(cls, cme: CME, grid: Array, key: Array, n_bootstrap: int) -> Self:
+        indices = jnp.arange(cme.dataset_shape_size)
+        gram = cme.kernel.y.gram(cme.ys)
+
+        def resample(bootstrap_indices_1_: Array, bootstrap_indices_2_: Array) -> Array:
+            return cls.__resample_beta(cme, grid, bootstrap_indices_1_, bootstrap_indices_2_, gram).max(axis=-1)
+
+        def resample_indices(key_: Array) -> Array:
+            return _resample_masked_population(
+                indices, cme.mask,
+                shape=(n_bootstrap, *cme.shape, cme.dataset_shape_size,),
+                key=key_
+            )
+
+        key_1, key_2 = jax.random.split(key)
+        bootstrap_indices_1 = resample_indices(key_1)
+        bootstrap_indices_2 = resample_indices(key_2)
+
+        bootstrap_beta = jax.lax.map(
+            f=lambda bootstrap_indices_pair: resample(*bootstrap_indices_pair),
+            xs=(bootstrap_indices_1, bootstrap_indices_2)
+        )
+
+        bootstrap_beta = bootstrap_beta.transpose(*range(1, bootstrap_beta.ndim), 0)
+
+        return BootstrapConditionalTestEmbedding(cme, bootstrap_beta)
+
+    @classmethod
+    @partial(jax.jit, static_argnums={0, 4})
+    def wild(cls, cme: CME, grid: Array, key: Array, n_bootstrap: int) -> Self:
+        gram_y = cme.kernel.y.gram(cme.ys)
+
+        influence_grid = cme.expand_dims(-1).influence(grid)
+        influence_xs = cme.expand_dims(-1).influence(cme.xs)
+
+        residual_coefficients = jnp.eye(cme.dataset_shape_size) - influence_xs
+        gram_residual = residual_coefficients @ gram_y @ residual_coefficients
+
+        def compute_squared_norm(noise_: Array) -> Array:
+            weights = influence_grid * noise_ * ~cme.mask
+            return jnp.einsum("...i,...ij,...j->...", weights, gram_residual[..., None, :, :], weights)
+
+        noise = jax.random.normal(key, shape=(n_bootstrap, cme.dataset_shape_size))
+        wild_norm_squared = jax.lax.map(compute_squared_norm, noise)
+        wild_norm = jnp.sqrt(jnp.clip(wild_norm_squared, min=0))
+
+        std = cls._std(cme.expand_dims(-1), grid, influence_grid)
+        bootstrap_beta = (wild_norm / std).max(axis=-1)
+        bootstrap_beta = bootstrap_beta.transpose(*range(1, bootstrap_beta.ndim), 0)
+
+        return BootstrapConditionalTestEmbedding(cme, bootstrap_beta)
+
+    def __post_init__(self):
+        if self.beta_null.shape[:-1] != self.cme.shape:
+            raise TypeError(f"Shape of beta_null does not match shape of cme. Got shapes {self.cme.shape} and "
+                            f"{self.cme.shape}.")
+
+    def __call__(self, x: Array) -> BootstrapConditionedTestEmbedding:
+        kme = self.cme(x)
+        std = self.std(x, kme.coefficients)
+        return BootstrapConditionedTestEmbedding(kme, std, self.beta_null)
+
+
+ConditionalTestEmbedding.analytical = AnalyticalConditionalTestEmbedding
+ConditionalTestEmbedding.bootstrap = BootstrapConditionalTestEmbedding
 
 
 class TwoSampleTest(NamedTuple):
-    t: Array
-    threshold: Array
     distance: Array
+    threshold: Array
 
     @classmethod
-    def from_embeddings(cls, embedding_1: TestEmbedding, embedding_2: TestEmbedding, level: ArrayLike) -> Self:
-        def threshold_combination(t: Array):
-            threshold_1 = embedding_1.threshold(t * level)
-            threshold_2 = embedding_2.threshold((1 - t) * level)
-            return threshold_1 + threshold_2
-
-        ts = jnp.linspace(start=0, stop=1, num=100)
-        thresholds = jax.vmap(threshold_combination)(ts)
-
-        optimal_t_index = thresholds.argmin(axis=0)
-        optimal_t = ts[optimal_t_index]
-        threshold = thresholds[optimal_t_index]
-
+    def from_embeddings(
+            cls, embedding_1: MarginalTestEmbedding, embedding_2: MarginalTestEmbedding, level: ArrayLike
+    ) -> Self:
         distance = rkhs.distance(embedding_1.kme, embedding_2.kme)
 
-        return TwoSampleTest(optimal_t, threshold, distance)
+        threshold_1 = embedding_1(level / 2)
+        threshold_2 = embedding_2(level / 2)
+        threshold = threshold_1 + threshold_2
 
-    def rejection_region(self) -> Array:
+        return TwoSampleTest(distance, threshold)
+
+    def rejection(self) -> Array:
         return self.distance > self.threshold
+
+
+MarginalTestEmbedding.bootstrap.from_data()
