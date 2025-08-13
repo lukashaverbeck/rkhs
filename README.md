@@ -18,9 +18,11 @@
   - **Mixed:** $H_0(x): P(\cdot\mid X=x)=Q$
 
 The test compares kernel embeddings in RKHS norm and rejects $H_0$ at level $\alpha$ if
+
 $$
-  \|\widehat\mu_P - \widehat\mu_Q\|_\mathcal{H} > \beta_P + \beta_Q,
+\|\widehat\mu_P - \widehat\mu_Q\|_\mathcal{H} > \beta_P + \beta_Q,
 $$
+
 where $\beta_\ast$ are finite-sample confidence radii from the selected regime.
 
 - **Confidence regimes**
@@ -32,7 +34,7 @@ where $\beta_\ast$ are finite-sample confidence radii from the selected regime.
 
 - **Kernels**
   Built-ins: `Gaussian`, `Matern`, `Laplacian`, `Polynomial`, `Linear`.  
-  Conditional tests use `VectorKernel(x=…, y=…, regularization=…)` to specify input and output kernels.
+  Conditional tests use `VectorKernel(x=..., y=..., regularization=...)` to specify input and output kernels.
 
 - **Decision interface**
   `test.reject()` (boolean at level $\alpha$), `test.distance` (empirical RKHS distance), `test.threshold` ($\beta_P+\beta_Q$).
