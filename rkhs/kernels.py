@@ -101,7 +101,7 @@ class LaplacianKernel(Kernel):
 
     def __init__(self, length_scale: float, data_shape: Sequence[int]):
         if len(data_shape) > 1:
-            raise ValueError(f"Gaussian kernel only supports scalar or 1D inputs. Got shape {data_shape}.")
+            raise ValueError(f"Laplacian kernel only supports scalar or 1D inputs. Got shape {data_shape}.")
 
         if jnp.any(length_scale <= 0):
             raise ValueError(f"Length scale must be positive. Got {length_scale}.")

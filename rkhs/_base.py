@@ -23,7 +23,7 @@ class Kernel(ABC):
     def data_ndim(self) -> int:
         return len(self.data_shape)
 
-    def __init__(self, data_shape: Sequence[int], rkhs_dim: RKHSDim):
+    def __init__(self, data_shape: Sequence[int], rkhs_dim: RKHSDim = "inf"):
         if any(shape < 0 for shape in data_shape):
             raise ValueError(f"Got negative data shape: {data_shape}.")
 
@@ -475,7 +475,6 @@ class CME(_MaskedShape):
 
         return vectorized_solve(k_x, self.cholesky) * ~self.mask
 
-
     @partial(jax.jit)
     def __call__(self, x: Array) -> Fn:
         self.kernel.x.check_shape(x)
@@ -501,8 +500,6 @@ class CME(_MaskedShape):
         return CME(kernel=self.kernel, xs=xs, ys=ys, cholesky=cholesky, mask=mask)
 
     def transpose(self, *axes: int) -> Self:
-        shape = tuple(self.shape[i] for i in axes)
-
         xs = self._transpose(self.xs, axes)
         ys = self._transpose(self.ys, axes)
         cholesky = self._transpose(self.cholesky, axes)
