@@ -5,7 +5,9 @@
 ---
 
 ## ⚙️ Installation
-**_Coming soon_**
+```bash
+pip install rkhs
+```
 
 ---
 
